@@ -7,8 +7,8 @@ from appdirs import user_data_dir
 from doit import create_after, task_params
 from os import environ
 
-DOIT_CONFIG = dict(verbosity=2)
-
+DOIT_CONFIG = dict(verbosity=2, list=dict(status=True, subtasks=True))
+PIP = ("python", "-m", "pip")
 HERE = Path()
 THIS = Path(__file__).parent
 NOXFILE = THIS / "noxfile.py"
@@ -54,7 +54,8 @@ def task_env(name="build"):
     yield dict(
         name="conda",
         actions=[
-            f'conda create -yc conda-forge --prefix {PREFIX} python=3.9 "nodejs>=14,<15" yarn git'
+            f'conda create -yc conda-forge --prefix {PREFIX} python=3.9 "nodejs>=14,<15" yarn git',
+            f"conda run --prefix {PREFIX} python -m pip install pip --upgrade",
         ],
         uptodate=[PREFIX.exists()],
         clean=[(rmdir, [PREFIX])],
@@ -64,36 +65,14 @@ def task_env(name="build"):
 @create_after("env")
 def task_lumino(repo="https://github.com/jupyterlab/lumino", dir=HERE / "build"):
     repo = Repo(url=repo, dir=dir)
-    print(repo)
     from json import loads
 
-    yield get_clone_task(repo.url, repo.path, repo.env)
-    print(repo)
-    yield dict(
-        name=f"install:yarn",
-        file_dep=[repo.package, repo.head],
-        actions=[(create_folder, [repo.links]), do(*repo.yarn, cwd=repo.path)],
-        targets=[repo.yarn_integrity],
-        task_dep=["lumino:clone"],
-    )
-
-    for pkg_json in repo.get_packages():
-        pkg = pkg_json.parent
-        pkg_data = loads(pkg_json.read_text(encoding="utf-8"))
-        pkg_name = pkg_data["name"]
-        out_link = repo.links / pkg_data["name"] / "package.json"
-
-        # only set lumino out links
-        yield dict(
-            name=f"link:out:{pkg_name}",
-            file_dep=[repo.yarn_integrity, pkg_json],
-            actions=[(create_folder, [repo.links]), do(*repo.yarn, "link", cwd=pkg)],
-            targets=[out_link],
-            task_dep=["lumino:install:yarn"],
-        )
+    yield repo.clone()
+    yield repo.yarn_install()
+    yield repo.yarn_link_out()
 
 
-@create_after("env")
+@create_after("lumino")
 def task_jupyterlab(
     repo="https://github.com/jupyterlab/jupyterlab", dir=HERE / "build"
 ):
@@ -101,27 +80,11 @@ def task_jupyterlab(
     print(repo)
     from json import loads
 
-    yield get_clone_task(repo.url, repo.path, repo.env)
-    yield dict(
-        name="install:pip",
-        file_dep=[repo.package, repo.head],
-        actions=[do(F"{repo.conda} pip install -e.", cwd=repo.path)]
-    )
-    yield dict(
-        name=f"install:yarn",
-        file_dep=[repo.package, repo.head],
-        actions=[(create_folder, [repo.links]), do(*repo.yarn, cwd=repo.path)],
-        targets=[repo.yarn_integrity],
-        task_dep=["jupyterlab:clone"],
-    )
-
-    for pkg_json in repo.get_packages():
-        pkg = pkg_json.parent
-        pkg_data = loads(pkg_json.read_text(encoding="utf-8"))
-        pkg_name = pkg_data["name"]
-        out_link = repo.links / pkg_data["name"] / "package.json"
-
-        # set lumino in links and jupyterlab out links
+    yield repo.clone()
+    yield repo.pip_install()
+    yield repo.yarn_install()
+    yield from Repo("https://github.com/jupyterlab/lumino").yarn_link_in()
+    yield repo.yarn_build()
 
 
 @dataclass
@@ -145,21 +108,117 @@ class Repo:
         self.package = self.path / "package.json"
         self.links = (self.dir / "repos" / ".yarn-links").resolve()
         self.env = (self.dir / ".env").resolve()
-        self.conda = [            "conda",
-            "run",
-            "--prefix",
-            self.env]
-        self.yarn = self.conda + [
-
-            "yarn",
-            "--link-folder",
-            self.links,
-        ]
+        self.conda = f"conda run --prefix {self.env.resolve()}"
+        self.yarn = f"{self.conda} yarn --link-folder {self.links.resolve()}"
+        self.pip = f"{self.conda} python -m pip"
+        self.activate = f"conda activate {self.env} &&"
         self.yarn_integrity = self.path / "node_modules" / ".yarn-integrity"
         self.setup = self.path / "setup.py"
 
     def get_packages(self, where="packages"):
         yield from (self.path / where).glob("*/package.json")
+
+    def clone(self, depth=1):
+        return dict(
+            name="clone",
+            actions=[
+                (create_folder, [self.path]),
+                f"""{self.conda} git clone --depth {depth} {self.url} {self.path}""",
+            ],
+            targets=[self.head],
+            uptodate=[self.head.exists()],
+        )
+
+    def pip_install(self):
+        return dict(
+            name=f"install:pip",
+            file_dep=[self.setup, self.head]
+            + (self.package.exists() and [self.package] or []),
+            actions=[
+                do(f"{self.pip} uninstall -y {self.name}"),
+                do(
+                    f"{self.pip} install --no-build-isolation --verbose {self.path.resolve()}"
+                ),
+            ],
+        )
+
+    def yarn_install(self):
+        return dict(
+            name=f"install:yarn",
+            file_dep=[self.package, self.head],
+            actions=[(create_folder, [self.links]), do(self.yarn, cwd=self.path)],
+            targets=[self.yarn_integrity],
+        )
+
+    def yarn_link_out(self):
+        from json import loads
+
+        for pkg_json in self.get_packages():
+            pkg = pkg_json.parent
+            pkg_data = loads(pkg_json.read_text(encoding="utf-8"))
+            pkg_name = pkg_data["name"]
+            out_link = self.links / pkg_data["name"] / "package.json"
+
+            # only set lumino out links
+            yield dict(
+                name=f"link:out:{pkg_name}",
+                file_dep=[self.yarn_integrity, pkg_json],
+                actions=[
+                    (create_folder, [self.links]),
+                    do(f"{self.yarn} link", cwd=pkg),
+                ],
+                targets=[out_link],
+                task_dep=[f"{self.name}:install:yarn"],
+            )
+
+    def yarn_link_in(self):
+        from json import loads
+
+        for pkg_json in self.get_packages():
+            pkg = pkg_json.parent
+            pkg_data = loads(pkg_json.read_text(encoding="utf-8"))
+            pkg_name = pkg_data["name"]
+            out_link = self.links / pkg_data["name"] / "package.json"
+            in_link = self.path / f"node_modules/{pkg_name}/package.json"
+
+            yield dict(
+                name=f"link:in:{pkg_name}",
+                uptodate=[
+                    config_changed(
+                        {
+                            pkg_name: (
+                                in_link.exists()
+                                and in_link.resolve() == pkg_json.resolve()
+                            )
+                        }
+                    )
+                ],
+                file_dep=[out_link],
+                task_dep=[f"{self.name}:link:out:{pkg_name}"],
+                actions=[do(f"{self.yarn} link {pkg_name}", cwd=self.path)],
+            )
+
+    def yarn_build(self):
+        return dict(
+            name="build",
+            doc="do a dev build of the current jupyterlab source",
+            file_dep=[
+                *self.links.glob("*/package.json"),
+                *self.links.glob("*/*/package.json"),
+                *sum(
+                    [
+                        # [*self.path.glob("packages/*/lib/*.js")] for self in PATHS.values()
+                    ],
+                    [],
+                ),
+            ],
+            task_dep=["jupyterlab:install:pip"],
+            actions=[
+                do(f"{self.yarn} clean", cwd=self.path),
+                do(f"{self.yarn} build:prod", cwd=self.path),
+            ],
+            targets=[],
+        )
 
 
 def get_name(id):
@@ -196,9 +255,8 @@ def do(*args, cwd=THIS, **kwargs):
     if len(args) == 1:
         args = args[0].split()
     kwargs.setdefault("env", {})
-    kwargs["env"] = environ
+    kwargs["env"] = dict(environ)
     kwargs["env"].update(ENV)
-    print(args, kwargs, cwd)
     return Action(
         list(map(str, args)), shell=False, cwd=str(Path(cwd).resolve()), **kwargs
     )
